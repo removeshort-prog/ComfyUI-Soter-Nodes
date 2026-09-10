@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>分类选择器 · 组件预览</title>
+  <link rel="stylesheet" href="/extensions/danbooru/category_panel.css">
+  <style>
+    body { margin: 0; min-height: 100vh; padding: 32px; box-sizing: border-box; background: #1b1b1b; color: #d5d5d5; font: 14px Arial, "Microsoft YaHei", sans-serif; }
+    main { max-width: 760px; margin: auto; }
+    h1 { margin: 0 0 10px; font-size: 23px; font-weight: 500; }
+    p { color: #969696; margin: 0 0 22px; }
+    #host { width: 520px; height: 460px; max-width: 100%; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Danbooru 分类选择器</h1>
+    <p>组件交互预览 · 非 ComfyUI 运行截图</p>
+    <div id="host"></div>
+  </main>
+  <script type="module">
+    import { createCategoryPanel, parseRows, mappingCategories, completeRows } from "/extensions/danbooru/category_panel.js";
+    import "/extensions/danbooru/category_selector.js";
+
+    const host = document.getElementById("host");
+    const legacyNames = ["tags", "excel_file", "category_mapping", "new_category_order", "default_category", "regex_blacklist", "tag_blacklist", "deduplicate_tags", "validation", "force_reload", "is_comment"];
+    const legacyValues = ["1girl, blue_hair, smile", "danbooru_tags.xlsx", "{('人物','数量'):'人物对象词',('角色','发色'):'角色特征词',('角色','表情'):'角色表情词'}", '["人物对象词","角色特征词","角色表情词"]', "未归类词", "censor", "watermark, text", true, false, false, true];
+
+    class MockNode {
+      constructor(values = legacyValues, options = {}) {
+        this.widgets = [];
+        this.inputs = [];
+        this.size = [400, 700];
+        this.changes = 0;
+        this.dirty = 0;
+        this.oldCalls = { created: 0, configured: 0, executed: 0, connected: 0 };
+        this.registered = new Set();
+        this.transactions = [];
+        const recordTransaction = phase => {
+          const value = this.widgets.find(widget => widget.name === "new_category_order")?.value;
+          this.transactions.push({ phase, rows: JSON.parse(value) });
+        };
+        this.graph = {
+          change: () => this.changes++,
+          beforeChange: () => recordTransaction("before"),
+          afterChange: () => recordTransaction("after"),
+        };
+        for (let index = 0; index < legacyNames.length; index++) {
+          const name = legacyNames[index];
+          if (name === "new_category_order") {
+            const textarea = document.createElement("textarea");
+            textarea.value = values[index];
+            const original = this.addDOMWidget(name, "customtext", textarea, {
+              getValue: () => textarea.value,
+              setValue: value => { textarea.value = value; },
+            });
+            original.inputEl = textarea;
+            this.originalOrder = original;
+          } else {
+            this.widgets.push({ name, value: values[index], options: {}, callback() {} });
+          }
+        }
+        if (options.convertedSlot) {
+          this.inputs.push({ name: "new_category_order", link: 7, widget: { name: "new_category_order" }, _widget: this.originalOrder });
+        }
+        if (options.legacyRemove) this.removeWidget = undefined;
+        this.onNodeCreated();
+      }
+      addDOMWidget(name, type, element, options) {
+        const widget = { name, type, element, options, removeCount: 0 };
+        Object.defineProperty(widget, "value", { get: () => options.getValue(), set: value => options.setValue(value) });
+        widget.onRemove = () => { widget.removeCount++; this.registered.delete(widget); element.remove(); };
+        this.widgets.push(widget);
+        const added = this.onAdded;
+        this.onAdded = function (...args) { added?.apply(this, args); this.registered.add(widget); };
+        const removed = this.onRemoved;
+        this.onRemoved = function (...args) { removed?.apply(this, args); widget.onRemove(); };
+        return widget;
+      }
+      removeWidget(widget) {
+        for (const slot of this.inputs) {
+          if (slot._widget === widget) {
+            slot.widget = undefined;
+            slot._widget = undefined;
+          }
+        }
+        widget.onRemove?.();
+        this.widgets.splice(this.widgets.indexOf(widget), 1);
+      }
+      setDirtyCanvas() { this.dirty++; }
+      setSize(size) { this.size = size; }
+      onNodeCreated() { this.oldCalls.created++; }
+      onConfigure() { this.oldCalls.configured++; }
+      onExecuted() { this.oldCalls.executed++; }
+      onConnectionsChange() { this.oldCalls.connected++; }
+      configure(values) {
+        values.forEach((value, index) => { this.widgets[index].value = value; });
+        this.onConfigure({ widgets_values: values });
+      }
+    }
+    for (const extension of globalThis.__extensions) {
+      extension.beforeRegisterNodeDef?.(MockNode, { name: "DanbooruTagSorterNode" });
+    }
+
+    const fixture = {
+      parseRows, mappingCategories, completeRows, legacyNames, legacyValues,
+      changes: [], resizes: 0,
+      mountPanel(value = '["人物对象词","角色特征词","角色表情词"]', categories = []) {
+        this.changes = [];
+        this.resizes = 0;
+        this.panel = createCategoryPanel({ value, onChange: value => this.changes.push(value), onResize: () => this.resizes++ });
+        this.panel.setCategories(categories);
+        host.replaceChildren(this.panel.element);
+        return this.panel;
+      },
+      mountNode(values = legacyValues, options = {}) {
+        const node = this.node = new MockNode(values, options);
+        node.onAdded();
+        host.replaceChildren(node.widgets.find(widget => widget.name === "new_category_order").element);
+        return node;
+      },
+      rows() { return JSON.parse(this.panel.getValue()); },
+    };
+    globalThis.fixture = fixture;
+    const demoRows = [
+      { name: "人物对象词", enabled: true }, { name: "画师词", enabled: false },
+      { name: "镜头词", enabled: true }, { name: "动作词", enabled: true },
+      { name: "角色表情词", enabled: true }, { name: "角色特征词", enabled: true },
+      { name: "角色部位词", enabled: false }, { name: "性征部位词", enabled: false },
+      { name: "未归类词", enabled: true },
+    ];
+    fixture.mountPanel(demoRows).setPreview([
+      { name: "人物对象词", tags: "1girl, solo" }, { name: "画师词", tags: "" },
+      { name: "镜头词", tags: "portrait, looking_at_viewer, upper_body" },
+      { name: "动作词", tags: "standing, holding_flower" },
+      { name: "角色表情词", tags: "smile, closed_mouth" },
+      { name: "角色特征词", tags: "blue_hair, long_hair, blue_eyes, hair_ornament" },
+      { name: "角色部位词", tags: "hands" }, { name: "性征部位词", tags: "" },
+      { name: "未归类词", tags: "soft_lighting, spring" },
+    ]);
+  </script>
+</body>
+</html>
