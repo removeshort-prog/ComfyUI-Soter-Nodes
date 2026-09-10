@@ -32,13 +32,21 @@ export function parseRows(value) {
     });
 }
 
-export function mappingCategories(value) {
+export function mappingCategories(value, includeNamedDefaults = false) {
     if (value && typeof value === "object") return [...new Set(Object.values(value).filter(v => typeof v === "string"))];
     const names = [];
     // Tokenize first so a colon inside a category name cannot become a mapping.
     const tokens = String(value || "").match(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|:/g) || [];
     for (let i = 1; i < tokens.length; i++) {
         if (tokens[i - 1] === ":" && tokens[i] !== ":") names.push(readString(tokens[i]));
+    }
+    if (includeNamedDefaults) {
+        const tupleKeys = new RegExp(`\\(\\s*(${STRING_TOKEN.source})\\s*,\\s*(${STRING_TOKEN.source})\\s*,?\\s*\\)\\s*:`, "g");
+        const keys = new Set([...String(value || "").matchAll(tupleKeys)]
+            .map(match => JSON.stringify([readString(match[1]), readString(match[2])])));
+        for (const [key, name] of [[["版权", "作品"], "版权"], [["角色", "角色名"], "角色名"]]) {
+            if (!keys.has(JSON.stringify(key))) names.push(name);
+        }
     }
     return [...new Set(names.filter(name => name.trim()))];
 }

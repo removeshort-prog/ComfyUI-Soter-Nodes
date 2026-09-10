@@ -9,6 +9,15 @@ document.head.append(stylesheet);
 const PANEL = Symbol("danbooruCategoryPanel");
 const field = (node, name) => node.widgets?.find(widget => widget.name === name);
 
+function labelOutputs(node) {
+    const labels = { "分类数据包": "分类数据包 · Getter", ALL_TAGS: "ALL_TAGS · 已选 tag" };
+    for (const output of node.outputs || []) {
+        if (labels[output.name] && (!output.label || output.label === output.name)) {
+            output.label = labels[output.name];
+        }
+    }
+}
+
 function installPanel(node) {
     if (node[PANEL]) return;
     const old = field(node, "new_category_order");
@@ -66,13 +75,13 @@ function installPanel(node) {
 
     const refreshCategories = () => {
         panel.setCategories([
-            ...mappingCategories(field(node, "category_mapping")?.value),
+            ...mappingCategories(field(node, "category_mapping")?.value, true),
             field(node, "default_category")?.value || "未归类词",
         ]);
         panel.setConnected(node.inputs?.some(input => input.name === "new_category_order" && input.link != null));
     };
     panel.refreshCategories = refreshCategories;
-    for (const name of ["tags", "excel_file", "category_mapping", "default_category", "regex_blacklist", "tag_blacklist", "deduplicate_tags"]) {
+    for (const name of ["tags", "excel_file", "category_mapping", "default_category", "regex_blacklist", "tag_blacklist", "deduplicate_tags", "danbooru_lookup"]) {
         const watched = field(node, name);
         if (!watched) continue;
         const changed = () => {
@@ -95,12 +104,14 @@ app.registerExtension({
         const created = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function (...args) {
             const result = created?.apply(this, args);
+            labelOutputs(this);
             installPanel(this);
             return result;
         };
         const configured = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (...args) {
             const result = configured?.apply(this, args);
+            labelOutputs(this);
             installPanel(this);
             this[PANEL]?.refreshCategories();
             return result;

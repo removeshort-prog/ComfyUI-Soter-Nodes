@@ -167,17 +167,69 @@ test("category selector browser interactions and ComfyUI adapter compatibility",
           registered: node.registered.size,
           removed: node.originalOrder.removeCount,
           created: node.oldCalls.created,
-          legacyNames: fixture.legacyNames,
+          legacyNames: fixture.currentNames,
           legacyValues: fixture.legacyValues,
         };
       });
       assert.deepEqual(result.names, result.legacyNames);
-      assert.equal(result.names.length, 11);
-      result.values.forEach((value, index) => { if (index !== 3) assert.deepEqual(value, result.legacyValues[index]); });
+      assert.equal(result.names.length, 12);
+      result.values.forEach((value, index) => { if (index !== 3 && index < 11) assert.deepEqual(value, result.legacyValues[index]); });
+      assert.equal(result.values[11], true);
       assert.equal(result.oldRegistered, false, "the original textarea must not be registered again by its onAdded callback");
       assert.equal(result.registered, 1);
       assert.ok(result.removed >= 1);
       assert.equal(result.created, 1);
+    });
+
+    await t.test("older workflows gain disabled copyright and character rows without resetting saved settings", async () => {
+      const restored = await page.evaluate(() => {
+        const node = fixture.mountNode();
+        node.configure(fixture.legacyValues);
+        return { rows: JSON.parse(node.widgets[3].value), comments: node.widgets[10].value, lookup: node.widgets[11].value };
+      });
+      for (const name of ["版权", "角色名"]) {
+        assert.equal(restored.rows.find(item => item.name === name).enabled, false);
+      }
+      assert.equal(restored.rows[0].name, "人物对象词");
+      assert.equal(restored.rows[0].enabled, true);
+      assert.equal(restored.comments, true);
+      assert.equal(restored.lookup, true);
+      await row("角色名").locator(".dts-toggle").click();
+      assert.equal(await page.evaluate(() => JSON.parse(fixture.node.widgets[3].value).find(item => item.name === "角色名").enabled), true);
+    });
+
+    await t.test("renamed copyright and character mappings do not add unused default rows", async () => {
+      const result = await page.evaluate(() => {
+        const values = fixture.legacyValues.slice();
+        values[2] = "{('版权', '作品'): '作品系列', ('角色', '角色名'): '登场角色'}";
+        values[3] = JSON.stringify([{ name: "作品系列", enabled: true }, { name: "登场角色", enabled: false }]);
+        const node = fixture.mountNode(values);
+        return {
+          rows: JSON.parse(node.widgets[3].value),
+          partial: fixture.mappingCategories("{('版权','作品'): '系列'}", true),
+        };
+      });
+      assert.deepEqual(result.rows, [
+        { name: "作品系列", enabled: true }, { name: "登场角色", enabled: false },
+        { name: "未归类词", enabled: false },
+      ]);
+      assert.deepEqual(result.partial, ["系列", "角色名"]);
+    });
+
+    await t.test("output guidance preserves existing ports, links and saved comment preference", async () => {
+      const outputs = await page.evaluate(() => fixture.mountNode().outputs);
+      assert.deepEqual(outputs.map(output => [output.name, output.type, output.links]), [
+        ["分类数据包", "TAG_BUNDLE", [1]], ["ALL_TAGS", "STRING", [2]],
+      ]);
+      assert.equal(outputs[0].label, "分类数据包 · Getter");
+      assert.equal(outputs[1].label, "ALL_TAGS · 已选 tag");
+      const restored = await page.evaluate(() => {
+        const node = fixture.node;
+        node.outputs[1].label = "我的提示词";
+        node.configure(fixture.legacyValues);
+        return { label: node.outputs[1].label, comments: node.widgets[10].value };
+      });
+      assert.deepEqual(restored, { label: "我的提示词", comments: true });
     });
 
     await t.test("ComfyUI restore, custom mapping changes, preview events and connections", async () => {
@@ -256,7 +308,7 @@ test("category selector browser interactions and ComfyUI adapter compatibility",
           result.registeredAfterRemoval = node.registered.size;
           return result;
         }, legacyRemove);
-        assert.equal(state.count, 11);
+        assert.equal(state.count, 12);
         assert.equal(state.slotName, "new_category_order");
         assert.equal(state.rebound, true);
         assert.equal(state.oldHidden, true);

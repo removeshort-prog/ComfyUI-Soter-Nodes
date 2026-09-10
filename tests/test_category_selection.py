@@ -48,6 +48,11 @@ class CategorySelectionTests(unittest.TestCase):
         self.names = ["外观", "表情", "镜头", "背景", "空分类", "未归类词"]
         self.node = node_module.DanbooruTagSorterNode()
         node_module._tag_cache.clear()
+        self.named_categories = {}
+        self.real_named_categories_loader = node_module.load_named_categories
+        named_loader_patch = patch.object(node_module, "load_named_categories", return_value=self.named_categories)
+        self.named_loader = named_loader_patch.start()
+        self.addCleanup(named_loader_patch.stop)
 
     def rows(self, enabled=()):
         return [{"name": name, "enabled": name in enabled} for name in self.names]
@@ -58,7 +63,7 @@ class CategorySelectionTests(unittest.TestCase):
             "category_mapping": repr(self.mapping),
             "new_category_order": json.dumps(order, ensure_ascii=False),
             "validation": True,
-            "is_comment": False,
+            "danbooru_lookup": False,
         }
         options.update(overrides)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -91,6 +96,36 @@ class CategorySelectionTests(unittest.TestCase):
         })
         self.assertEqual(text, "looking_at_viewer, \nunknown_tag, \nblue_eyes, red_hair, ")
 
+    def test_default_output_is_plain_selected_tags_with_chinese_bundle_keys(self):
+        mapping = dict(self.mapping)
+        mapping[("镜头", "视线")] = "镜头词"
+        mapping[("角色", "眼睛")] = "人物对象词"
+        mapping[("角色", "头发")] = "人物对象词"
+        rows = [
+            {"name": "镜头词", "enabled": True},
+            {"name": "表情", "enabled": False},
+            {"name": "人物对象词", "enabled": True},
+        ]
+        response = self.process(
+            "red_hair, smile, looking_at_viewer, blue_eyes", rows,
+            category_mapping=repr(mapping),
+        )
+        bundle, text = response["result"]
+        self.assertEqual(text, "looking_at_viewer, \nblue_eyes, red_hair, ")
+        self.assertEqual(list(bundle), ["镜头词", "人物对象词"])
+        self.assertEqual(bundle, {
+            "镜头词": "looking_at_viewer, ",
+            "人物对象词": "blue_eyes, red_hair, ",
+        })
+        self.assertEqual(self.preview(response)["表情"], "smile, ")
+        for unwanted in ("smile", "镜头词", "人物对象词", "{", "}", "[", "]", "\\u"):
+            self.assertNotIn(unwanted, text)
+        getter = node_module.DanbooruTagGetterNode()
+        self.assertEqual(getter.get_tag(bundle, "镜头词"), ("looking_at_viewer, ",))
+        self.assertEqual(getter.get_tag(bundle, "人物对象词"), ("blue_eyes, red_hair, ",))
+        self.assertEqual(getter.get_tag(bundle, "表情"), ("",))
+        self.assertFalse(self.node.INPUT_TYPES()["optional"]["is_comment"][1]["default"])
+
     def test_disabled_category_tags_do_not_leak_into_default(self):
         response = self.process("smile, blue_eyes, unknown_tag", self.rows(["未归类词"]))
         self.assertEqual(response["result"], ({"未归类词": "unknown_tag, "}, "unknown_tag, "))
@@ -102,7 +137,7 @@ class CategorySelectionTests(unittest.TestCase):
         response = self.process("smile, blue_eyes", [{"name": "外观", "enabled": True}])
         self.assertEqual(response["result"], ({"外观": "blue_eyes, "}, "blue_eyes, "))
         preview = self.preview(response)
-        self.assertEqual(set(preview), set(self.names))
+        self.assertEqual(set(preview), set(self.names) | {"版权", "角色名"})
         self.assertEqual(preview["表情"], "smile, ")
         self.assertEqual(preview["空分类"], "")
         self.assertEqual(preview["未归类词"], "")
@@ -194,6 +229,200 @@ class CategorySelectionTests(unittest.TestCase):
         self.assertEqual(bundle["自定义·情绪 🌸"], "smile, ")
         self.assertEqual(text, "fallback_known, unknown_一, unknown_二, \nsmile, ")
 
+    def test_named_categories_split_mixed_database_and_supplement_absent_names(self):
+        with self.database.open("a", encoding="utf-8", newline="") as stream:
+            csv.writer(stream).writerows([
+                ["sample_series", "二次元角色", ""],
+                ["sample_hero", "二次元角色", ""],
+            ])
+        self.named_categories.update({
+            "sample series": "copyright",
+            "sample hero": "character",
+            "supplemental hero": "character",
+        })
+        rows = [
+            {"name": "角色名", "enabled": True},
+            {"name": "版权", "enabled": True},
+            {"name": "未归类词", "enabled": True},
+        ]
+        response = self.process("supplemental_hero, sample_series, smile, sample_hero, unknown_tag", rows)
+        self.assertEqual(response["result"], ({
+            "角色名": "sample_hero, supplemental_hero, ",
+            "版权": "sample_series, ",
+            "未归类词": "unknown_tag, ",
+        }, "sample_hero, supplemental_hero, \nsample_series, \nunknown_tag, "))
+        self.assertEqual(self.preview(response)["表情"], "smile, ")
+
+    def test_old_structured_rows_preview_new_categories_without_enabling_them(self):
+        self.named_categories.update({"sample series": "copyright", "sample hero": "character"})
+        response = self.process("sample_series, sample_hero, unknown_tag", self.rows(["未归类词"]))
+        self.assertEqual(response["result"], ({"未归类词": "unknown_tag, "}, "unknown_tag, "))
+        preview = self.preview(response)
+        self.assertEqual(preview["版权"], "sample_series, ")
+        self.assertEqual(preview["角色名"], "sample_hero, ")
+
+    def test_explicit_database_mapping_wins_over_named_category_metadata(self):
+        self.named_categories["red hair"] = "character"
+        response = self.process("red_hair", self.rows(["外观"]))
+        self.assertEqual(response["result"], ({"外观": "red_hair, "}, "red_hair, "))
+        self.assertEqual(self.preview(response)["角色名"], "")
+
+    def test_custom_named_category_mapping_controls_output_names_and_order(self):
+        self.named_categories.update({"sample series": "copyright", "sample hero": "character"})
+        mapping = dict(self.mapping)
+        mapping[("版权", "作品")] = "作品清单"
+        mapping[("角色", "角色名")] = "人物清单"
+        rows = [{"name": "人物清单", "enabled": True}, {"name": "作品清单", "enabled": True}]
+        response = self.process("sample_series, sample_hero", rows, category_mapping=repr(mapping))
+        self.assertEqual(response["result"], ({
+            "人物清单": "sample_hero, ", "作品清单": "sample_series, ",
+        }, "sample_hero, \nsample_series, "))
+        self.assertNotIn("版权", self.preview(response))
+        self.assertNotIn("角色名", self.preview(response))
+
+    def test_new_node_defaults_classify_real_snapshot_names_without_extra_csv_rows(self):
+        self.named_loader.side_effect = self.real_named_categories_loader
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = self.node.process(
+                "suzuran_(arknights), arknights, vulpisfoglia_(arknights)",
+                excel_file=str(self.database), danbooru_lookup=False,
+            )
+        bundle, text = response["result"]
+        self.assertEqual(list(bundle)[:2], ["版权", "角色名"])
+        self.assertEqual(len(bundle), 14)
+        self.assertEqual(bundle["版权"], "arknights, ")
+        self.assertEqual(bundle["角色名"], "suzuran_(arknights), vulpisfoglia_(arknights), ")
+        self.assertEqual(text, "arknights, \nsuzuran_(arknights), vulpisfoglia_(arknights), ")
+        self.assertEqual(self.preview(response)["未归类词"], "")
+        self.assertTrue(self.node.INPUT_TYPES()["optional"]["danbooru_lookup"][1]["default"])
+
+    def test_gallery_space_and_escaped_parentheses_are_matched_without_rewriting_tags(self):
+        self.named_categories.update({"sample series": "copyright", "sample hero (series)": "character"})
+        rows = [{"name": "版权", "enabled": True}, {"name": "角色名", "enabled": True}]
+        response = self.process(r"sample hero \(series\), sample series", rows)
+        self.assertEqual(response["result"], ({
+            "版权": "sample series, ", "角色名": r"sample hero \(series\), ",
+        }, "sample series, \n" + r"sample hero \(series\), "))
+
+    def test_live_lookup_only_queries_unresolved_unfiltered_names(self):
+        self.named_categories["offline hero"] = "character"
+        rows = [
+            {"name": "版权", "enabled": True},
+            {"name": "角色名", "enabled": True},
+            {"name": "未归类词", "enabled": True},
+        ]
+        with patch.object(node_module, "lookup_named_categories", return_value={
+            "new series": "copyright", "new hero (series)": "character",
+        }) as lookup:
+            response = self.process(
+                r"new_series, red_hair, offline_hero, blocked_tag, skip_censor, new hero \(series\), unknown_tag, new_series",
+                rows, danbooru_lookup=True, deduplicate_tags=True,
+                tag_blacklist="blocked_tag", regex_blacklist="censor",
+            )
+        self.assertEqual(lookup.call_count, 1)
+        self.assertEqual(set(lookup.call_args.args[0]), {"new series", "new hero (series)", "unknown tag"})
+        self.assertEqual(response["result"], ({
+            "版权": "new_series, ",
+            "角色名": r"offline_hero, new hero \(series\), ",
+            "未归类词": "unknown_tag, ",
+        }, "new_series, \noffline_hero, " + "new hero \\(series\\), \nunknown_tag, "))
+        self.assertEqual(self.preview(response)["外观"], "red_hair, ")
+
+    def test_live_classified_names_in_disabled_new_categories_do_not_leak_into_default(self):
+        with patch.object(node_module, "lookup_named_categories", return_value={
+            "new series": "copyright", "new hero": "character",
+        }):
+            response = self.process(
+                "new_series, new_hero, unknown_tag", self.rows(["未归类词"]), danbooru_lookup=True,
+            )
+        self.assertEqual(response["result"], ({"未归类词": "unknown_tag, "}, "unknown_tag, "))
+        preview = self.preview(response)
+        self.assertEqual(preview["版权"], "new_series, ")
+        self.assertEqual(preview["角色名"], "new_hero, ")
+
+    def test_live_classification_of_existing_unmapped_csv_tag_does_not_poison_offline_cache(self):
+        rows = [{"name": "角色名", "enabled": True}, {"name": "未归类词", "enabled": True}]
+        with patch.object(node_module, "lookup_named_categories", return_value={"fallback known": "character"}):
+            online = self.process("fallback_known", rows, danbooru_lookup=True)
+        self.assertEqual(online["result"], ({"角色名": "fallback_known, ", "未归类词": ""}, "fallback_known, "))
+        with patch.object(node_module, "lookup_named_categories") as lookup:
+            offline = self.process("fallback_known", rows)
+        lookup.assert_not_called()
+        self.assertEqual(offline["result"], ({"角色名": "", "未归类词": "fallback_known, "}, "fallback_known, "))
+
+    def test_interrogator_output_uses_offline_and_live_categories_without_gallery(self):
+        self.named_categories.update({"arknights": "copyright", "known character": "character"})
+        prompt = {
+            "10": {"class_type": "WD14Tagger", "inputs": {}},
+            "20": {"class_type": "DanbooruTagSorterNode", "inputs": {"tags": ["10", 0]}},
+        }
+        rows = [{"name": name, "enabled": True} for name in ["版权", "角色名", "外观"]]
+        with patch.object(node_module, "lookup_named_categories", return_value={"new character": "character"}) as lookup:
+            response = self.process("blue_eyes, arknights, known_character, new_character", rows,
+                                    prompt=prompt, unique_id="20", danbooru_lookup=True)
+        lookup.assert_called_once_with(["new character"])
+        self.assertEqual(response["result"], ({
+            "版权": "arknights, ",
+            "角色名": "known_character, new_character, ",
+            "外观": "blue_eyes, ",
+        }, "arknights, \nknown_character, new_character, \nblue_eyes, "))
+
+    def test_gallery_hidden_metadata_classifies_current_tags_without_network(self):
+        tags = r"arknights, suzuran_\(arknights\), new_prop, known_artist, width_1024"
+        prompt = {"7": {"class_type": "DanbooruTagSorterNode", "inputs": {"tags": ["3", 1]}}}
+        rows = [
+            {"name": "角色名", "enabled": True},
+            {"name": "版权", "enabled": True},
+            {"name": "未归类词", "enabled": True},
+        ]
+        with patch.object(node_module, "get_gallery_categories", return_value={
+            "arknights": "copyright", "suzuran (arknights)": "character",
+            "new prop": "general", "known artist": "artist", "width 1024": "meta",
+        }) as gallery, patch.object(node_module, "lookup_named_categories") as lookup:
+            response = self.process(tags, rows, prompt=prompt, unique_id="7", danbooru_lookup=True)
+        gallery.assert_called_once_with(prompt, "7", tags)
+        lookup.assert_not_called()
+        self.assertEqual(response["result"], ({
+            "角色名": r"suzuran_\(arknights\), ",
+            "版权": "arknights, ",
+            "未归类词": "new_prop, known_artist, width_1024, ",
+        }, "suzuran_\\(arknights\\), \narknights, \nnew_prop, known_artist, width_1024, "))
+        self.assertEqual(self.node.INPUT_TYPES()["hidden"], {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"})
+
+    def test_gallery_categories_override_offline_metadata_without_contaminating_other_images(self):
+        self.named_categories["fallback known"] = "character"
+        rows = [
+            {"name": "版权", "enabled": True},
+            {"name": "角色名", "enabled": True},
+            {"name": "未归类词", "enabled": True},
+        ]
+        with patch.object(node_module, "get_gallery_categories", side_effect=[
+            {"fallback known": "copyright"}, {"fallback known": "general"}, {},
+        ]), patch.object(node_module, "lookup_named_categories") as lookup, \
+                patch.object(node_module.pd, "read_csv", wraps=node_module.pd.read_csv) as read_csv:
+            copyright_image = self.process("fallback_known", rows, danbooru_lookup=True)
+            general_image = self.process("fallback_known", rows, danbooru_lookup=True)
+            plain_input = self.process("fallback_known", rows, danbooru_lookup=True)
+        lookup.assert_not_called()
+        self.assertEqual(read_csv.call_count, 1)
+        self.assertEqual(copyright_image["result"][0], {"版权": "fallback_known, ", "角色名": "", "未归类词": ""})
+        self.assertEqual(general_image["result"][0], {"版权": "", "角色名": "", "未归类词": "fallback_known, "})
+        self.assertEqual(plain_input["result"][0], {"版权": "", "角色名": "fallback_known, ", "未归类词": ""})
+
+    def test_gallery_metadata_respects_user_database_and_named_category_mappings(self):
+        self.named_categories["red hair"] = "copyright"
+        mapping = dict(self.mapping)
+        mapping[("角色", "角色名")] = "我的角色"
+        rows = [{"name": "我的角色", "enabled": True}, {"name": "外观", "enabled": True}]
+        with patch.object(node_module, "get_gallery_categories", return_value={
+            "red hair": "character", "new hero": "character",
+        }), patch.object(node_module, "lookup_named_categories") as lookup:
+            response = self.process("red_hair, new_hero", rows, category_mapping=repr(mapping), danbooru_lookup=True)
+        lookup.assert_not_called()
+        self.assertEqual(response["result"], ({
+            "我的角色": "new_hero, ", "外观": "red_hair, ",
+        }, "new_hero, \nred_hair, "))
+
     def test_duplicate_categories_keep_first_choice_without_duplicating_tags(self):
         rows = [
             {"name": "外观", "enabled": False},
@@ -240,6 +469,11 @@ class CategorySelectionTests(unittest.TestCase):
                 response = self.process("red_hair, blue_eyes", [], new_category_order=order)
                 self.assertIsInstance(response, tuple)
                 self.assertEqual(response[0]["外观"], "blue_eyes, red_hair, ")
+
+    def test_legacy_workflow_with_explicit_comments_preserves_category_labels(self):
+        response = self.process("smile, red_hair", self.names, is_comment=True)
+        self.assertIsInstance(response, tuple)
+        self.assertEqual(response[1], "外观:\nred_hair, \n表情:\nsmile, ")
 
     def test_legacy_validation_still_rejects_missing_mapping_categories(self):
         with self.assertRaises(ValueError):

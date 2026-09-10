@@ -1,20 +1,62 @@
 import pandas as pd
 from collections import defaultdict
+from functools import lru_cache
 import os
 import ast
 import hashlib
 import json
 import re
 
+if __package__:
+    from .danbooru_lookup import lookup_named_categories, clear_lookup_cache
+    from .gallery_metadata import get_gallery_categories
+else:
+    from danbooru_lookup import lookup_named_categories, clear_lookup_cache
+    from gallery_metadata import get_gallery_categories
+
 _tag_cache = {}
+NAMED_CATEGORY_MAPPINGS = {
+    "copyright": (("版权", "作品"), "版权"),
+    "character": (("角色", "角色名"), "角色名"),
+}
+
+
+def normalize_tag_key(tag):
+    # Gallery prompts may replace underscores and escape CLIP parentheses.
+    return tag.strip().lower().replace("\\(", "(").replace("\\)", ")").replace("_", " ")
+
+
+@lru_cache(maxsize=1)
+def load_named_categories():
+    """Read offline Danbooru category metadata; names are never guessed."""
+    path = os.path.join(os.path.dirname(__file__), "tags_database", "named_categories.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+        if data.get("version") != 1:
+            raise ValueError("不支持的分类表版本")
+        result = {}
+        for kind in NAMED_CATEGORY_MAPPINGS:
+            names = data[kind]
+            if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+                raise ValueError("分类表必须包含 tag 名称列表")
+            for name in names:
+                result[normalize_tag_key(name)] = kind
+        return result
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"[DanbooruTagSorter] 无法读取版权/角色名分类表，请完整更新插件：{error}")
+        return {}
 
 
 def load_defaults_from_json():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(current_dir, "defaults_config.json")
 
-    fallback_mapping = "{}"
-    fallback_order = json.dumps([{"name": "未归类词", "enabled": True}], ensure_ascii=False)
+    fallback_mapping = repr(dict(NAMED_CATEGORY_MAPPINGS.values()))
+    fallback_order = json.dumps(
+        [{"name": name, "enabled": True} for name in ("版权", "角色名", "未归类词")],
+        ensure_ascii=False,
+    )
 
     if not os.path.exists(config_path):
         print(f"[DanbooruTagSorter] Warning喵：未找到配置文件{config_path}喵，将使用空默认值喵。")
@@ -25,6 +67,10 @@ def load_defaults_from_json():
             data = json.load(f)
 
         mapping_list = data.get("mapping", [])
+        existing_keys = {tuple(item[:2]) for item in mapping_list if len(item) >= 3}
+        for key, target in NAMED_CATEGORY_MAPPINGS.values():
+            if key not in existing_keys:
+                mapping_list.append([*key, target])
         # Every mapped category is visible, even if the old order omitted it.
         category_names = list(data.get("order", []))
         category_names.extend(item[2] for item in mapping_list if len(item) >= 3)
@@ -97,20 +143,28 @@ def normalize_category_selection(order, category_mapping, default_category):
 # Sorter类
 class DanbooruTagSorter:
     def __init__(self, excel_path, category_mapping, new_category_order, default_category="未归类词",
-                 enabled_categories=None):
+                 enabled_categories=None, danbooru_lookup=False, gallery_categories=None):
         self.excel_path = excel_path
         self.category_mapping = category_mapping  # 映射规则 {('原有大类', '原有小类'): '新分类名'}
         self.new_category_order = new_category_order  # 定义输出时各个分类及各个分类的顺序
         self.default_category = default_category
         self.enabled_categories = enabled_categories
+        self.danbooru_lookup = danbooru_lookup
+        self.gallery_categories = gallery_categories or {}
         self.category_preview = []
+        self.named_tag_categories = load_named_categories()
         self.tag_db = self._load_database_with_cache()  # 初始化立刻先尝试加载或从缓存获取数据库
 
     # 根据原始的大类小类查表，得到新的分类名
-    def get_new_category(self, original_category, original_subcategory):
+    def get_new_category(self, original_category, original_subcategory, tag_key=None):
         key = (original_category, original_subcategory)
-        # 如果查不到就返回default_category，由用户自己设定
-        return self.category_mapping.get(key, self.default_category)
+        if key in self.category_mapping:
+            return self.category_mapping[key]
+        kind = self.named_tag_categories.get(tag_key)
+        if kind is not None:
+            named_key, default_name = NAMED_CATEGORY_MAPPINGS[kind]
+            return self.category_mapping.get(named_key, default_name)
+        return self.default_category
 
     # 生成哈希键
     # 判断当前的配置参数是否和上次缓存一致
@@ -156,10 +210,9 @@ class DanbooruTagSorter:
                 cat = str(row['category']).strip()
                 sub = str(row['subcategory']).strip()
 
-                #计算该tag映射后是谁家的兵
-                new_cat = self.get_new_category(cat, sub)
                 #所有的下划线都替换为空格以匹配输入习惯
-                clean_key = eng_tag.replace('_', ' ')
+                clean_key = normalize_tag_key(eng_tag)
+                new_cat = self.get_new_category(cat, sub, clean_key)
                 tag_db[clean_key] = {
                     'original': eng_tag,
                     'original_category': cat,
@@ -210,18 +263,59 @@ class DanbooruTagSorter:
         new_category_buckets = defaultdict(list)
         unmatched_tags = []
 
+        filtered_tags = [
+            tag for tag in input_tags
+            if tag.lower() not in exact_blacklist_set and not (regex_pattern and regex_pattern.search(tag))
+        ]
+        live_categories = {}
+        if self.danbooru_lookup:
+            candidates = []
+            for tag in filtered_tags:
+                key = normalize_tag_key(tag)
+                if key in self.named_tag_categories or key in self.gallery_categories:
+                    continue
+                info = self.tag_db.get(key)
+                if info is not None:
+                    original = (info['original_category'], info['original_subcategory'])
+                    if original in self.category_mapping or info['new_category'] != self.default_category:
+                        continue
+                candidates.append(key)
+            if candidates:
+                live_categories = lookup_named_categories(candidates)
+
         allowed_categories_set = set(self.new_category_order)
-        # 遍历每一个输入tag进行匹配
-        for tag in input_tags:
-            tag_clean = tag.strip()
-            tag_lower = tag_clean.lower()
-            # 黑名单check
-            if (tag_lower in exact_blacklist_set or
-                    (regex_pattern and regex_pattern.search(tag_clean))):
-                continue
-            lookup_key = tag_lower.replace('_', ' ')  # 构造查询Key
-            if lookup_key in self.tag_db:  # 缓存命中
-                info = self.tag_db[lookup_key]
+        for tag in filtered_tags:
+            lookup_key = normalize_tag_key(tag)
+            info = self.tag_db.get(lookup_key)
+            explicit_mapping = info is not None and (
+                info['original_category'], info['original_subcategory']
+            ) in self.category_mapping
+            if lookup_key in self.gallery_categories and not explicit_mapping:
+                kind = self.gallery_categories[lookup_key]
+                if kind in NAMED_CATEGORY_MAPPINGS:
+                    named_key, default_name = NAMED_CATEGORY_MAPPINGS[kind]
+                    info = {
+                        "new_category": self.category_mapping.get(named_key, default_name),
+                        "rank": info['rank'] if info is not None else float("inf"),
+                    }
+                elif info is not None:
+                    # Gallery explicitly labels this as general/artist/meta;
+                    # do not override it with an older offline name category.
+                    info = {**info, "new_category": self.default_category}
+            elif lookup_key in live_categories:
+                named_key, default_name = NAMED_CATEGORY_MAPPINGS[live_categories[lookup_key]]
+                info = {
+                    "new_category": self.category_mapping.get(named_key, default_name),
+                    "rank": info['rank'] if info is not None else float("inf"),
+                }
+            elif info is None and lookup_key in self.named_tag_categories:
+                # Supplementary names need no extra Excel rows. Stable sorting
+                # leaves these after database-ranked tags in their input order.
+                info = {
+                    "new_category": self.get_new_category(None, None, lookup_key),
+                    "rank": float("inf"),
+                }
+            if info is not None:
                 group_key = info['new_category']
                 # 检查该分类是否在Order列表中
                 if group_key in allowed_categories_set:
@@ -331,18 +425,35 @@ class DanbooruTagSorterNode:
                 "deduplicate_tags": ("BOOLEAN", {"default": False, "label": "自动去重"}),
                 "validation": ("BOOLEAN", {"default": True, "label": "配置校验"}),
                 "force_reload": ("BOOLEAN", {"default": False, "label": "强制重载"}),
-                "is_comment": ("BOOLEAN", {"default": True, "label": "保留注释"}),
-            }
+                "is_comment": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "含分类名",
+                    "label_off": "仅 tag",
+                    "tooltip": "关闭时 ALL_TAGS 只输出已启用分类的 tag，可直接连接文本预览或提示词编码节点。"
+                }),
+                "danbooru_lookup": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "补查 D 站分类",
+                    "label_off": "仅本地分类",
+                    "tooltip": "优先读取直连 Booru 画廊的已有分类，本地也未识别的 tag 再向 Danbooru 补查版权/角色名。查询失败时继续使用默认分类。"
+                }),
+            },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("TAG_BUNDLE", "STRING")
     RETURN_NAMES = ("分类数据包", "ALL_TAGS")
+    OUTPUT_TOOLTIPS = (
+        "分类字典，供 Getter 按分类提取；需要纯 tag 时请使用 ALL_TAGS。",
+        "已启用分类的 tag，按列表顺序输出；is_comment 关闭时不含分类标题。",
+    )
     FUNCTION = "process"
     CATEGORY = "Danbooru Tags"
 
     def process(self, tags, excel_file="danbooru_tags.xlsx", category_mapping="", new_category_order="",
                 default_category="未归类词", regex_blacklist="", tag_blacklist="",
-                deduplicate_tags=False, validation=True, force_reload=False, is_comment=True):
+                deduplicate_tags=False, validation=True, force_reload=False, is_comment=False,
+                danbooru_lookup=True, prompt=None, unique_id=None):
 
         # 自动定位
         current_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -383,6 +494,10 @@ class DanbooruTagSorterNode:
             print(f"Order解析错误喵...{e}")
             cat_order = []
 
+        if any(isinstance(item, dict) for item in cat_order):
+            cat_map = dict(cat_map)
+            for key, target in NAMED_CATEGORY_MAPPINGS.values():
+                cat_map.setdefault(key, target)
         cat_order, enabled_categories = normalize_category_selection(cat_order, cat_map, default_category)
 
         # 校验Mapping和Order是否都有
@@ -398,9 +513,13 @@ class DanbooruTagSorterNode:
         if force_reload:
             global _tag_cache
             _tag_cache.clear()
+            load_named_categories.cache_clear()
+            clear_lookup_cache()
 
         # 将处理好的绝对路径传递给Sorter
-        sorter = DanbooruTagSorter(final_excel_path, cat_map, cat_order, default_category, enabled_categories)
+        gallery_categories = get_gallery_categories(prompt, unique_id, tags)
+        sorter = DanbooruTagSorter(final_excel_path, cat_map, cat_order, default_category, enabled_categories,
+                                   danbooru_lookup=danbooru_lookup, gallery_categories=gallery_categories)
         all_str, cat_dict = sorter.process_tags(tags, is_comment, regex_blacklist, tag_blacklist, deduplicate_tags)
         if enabled_categories is not None:
             return {"ui": {"category_preview": [sorter.category_preview]}, "result": (cat_dict, all_str)}
@@ -443,6 +562,8 @@ class DanbooruTagClearCacheNode:
     def clear_cache(self):
         global _tag_cache
         _tag_cache.clear()
+        load_named_categories.cache_clear()
+        clear_lookup_cache()
         print("缓存已经清除了喵...")
         return ()
 
