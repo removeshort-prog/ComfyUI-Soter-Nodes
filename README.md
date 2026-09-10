@@ -1,10 +1,11 @@
-# ComfyUI-Soter-Nodes
+<img width="2173" height="1187" alt="例图" src="https://github.com/user-attachments/assets/900ef4a4-74d9-44d0-88eb-4f9a2eb0b290" /># ComfyUI-Soter-Nodes
 
 ComfyUI 的 Danbooru tag 分类节点。将逗号分隔的提示词按数据库分类，在 Packer 内逐项启用、预览和排序，再输出选中的分类数据包与完整文本。
 
 本仓库基于 [RafealaSilva/ComfyUI-Danbooru-Tag-Sorter-Node](https://github.com/RafealaSilva/ComfyUI-Danbooru-Tag-Sorter-Node) 扩展，保留原节点名称及接口。当前改版为本仓库 **2.2.1**，更新记录见 [CHANGELOG](CHANGELOG.md)。
 
-![分类选择器控件预览](example/category-selector-preview.png)
+![分类选择器控件预览](<img width="2173" height="1187" alt="例图" src="https://github.com/user-attachments/assets/206da888-54cd-42cd-8c63-fe443740963c" />
+)
 
 *上图为实际前端控件在独立浏览器测试页面中的截图，使用示例 tag；不是完整 ComfyUI 工作流运行截图。*
 
